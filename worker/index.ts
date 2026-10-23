@@ -16,7 +16,13 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === "/api/github/propose") {
-    return handleGitHubGateway(request, env);
+    return handleGitHubGateway(
+    request,
+    env as Env & {
+        GITHUB_TOKEN: string;
+        GATEWAY_API_KEY: string;
+    },
+);
 		}
 
 		// API: Start a new workflow instance
