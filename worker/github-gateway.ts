@@ -117,87 +117,65 @@ export async function handleGitHubGateway(
   }
 
   const seen = new Set<string>();
-  for (const item of files) {
-    if (
-      typeof item !== "object" ||
-      item === null ||
-      !("path" in item) ||
-      !("content" in item)
-    ) {
-      return json({ error: "Each file needs path and content" }, 400);
-    }
+  for (const item of files as { path: string; content: string }[]) {
+      const encodedPath = item.path
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/");
 
-    const file = item as { path: unknown; content: unknown };
-    if (
-      !validPath(file.path) ||
-      typeof file.content !== "string" ||
-      new TextEncoder().encode(file.content).byteLength > 100_000 ||
-      seen.has(file.path)
-    ) {
-      return json({ error: "Invalid, duplicate, or oversized file" }, 400);
-    }
+      const existingResponse = await github(
+        env.GITHUB_TOKEN,
+        `${apiBase}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`,
+      );
 
-    seen.add(file.path);
-  }
+      let existingSha: string | undefined;
 
-  const apiBase = `/repos/${TARGET_OWNER}/${TARGET_REPO}`;
-  const branch = `gateway/proposal-${crypto.randomUUID()}`;
+      if (existingResponse.ok) {
+        const existingData = (await existingResponse.json()) as {
+          sha: string;
+        };
+        existingSha = existingData.sha;
+      } else if (existingResponse.status !== 404) {
+        return json({
+          error: "Could not check existing file",
+          branch,
+        }, 502);
+      }
 
-  try {
-    const baseResponse = await github(
-      env.GITHUB_TOKEN,
-      `${apiBase}/git/ref/heads/main`,
-    );
-    if (!baseResponse.ok) {
-      return json({ error: "Could not read base branch" }, 502);
-    }
+      const payload: {
+        message: string;
+        content: string;
+        branch: string;
+        sha?: string;
+      } = {
+        message: `Proposed update: ${item.path}`,
+        content: btoa(
+          Array.from(
+            new TextEncoder().encode(item.content),
+            (byte) => String.fromCharCode(byte),
+          ).join(""),
+        ),
+        branch,
+      };
 
-    const baseData = (await baseResponse.json()) as {
-      object: { sha: string };
-    };
+      if (existingSha) {
+        payload.sha = existingSha;
+      }
 
-    const branchResponse = await github(
-      env.GITHUB_TOKEN,
-      `${apiBase}/git/refs`,
-      "POST",
-      {
-        ref: `refs/heads/${branch}`,
-        sha: baseData.object.sha,
-      },
-    );
-
-    if (!branchResponse.ok) {
-      return json({ error: "Could not create proposal branch" }, 502);
-    }
-
-    for (const item of files as { path: string; content: string }[]) {
       const result = await github(
         env.GITHUB_TOKEN,
-        `${apiBase}/contents/${item.path
-          .split("/")
-          .map(encodeURIComponent)
-          .join("/")}`,
+        `${apiBase}/contents/${encodedPath}`,
         "PUT",
-        {
-          message: `Proposed update: ${item.path}`,
-          content: btoa(
-            Array.from(
-              new TextEncoder().encode(item.content),
-              (byte) => String.fromCharCode(byte),
-            ).join(""),
-          ),
-          branch,
-        },
+        payload,
       );
 
       if (!result.ok) {
-        // Не публикуем детали GitHub API и не раскрываем токены.
         return json({
           error: "A file update failed; proposal branch may be incomplete",
           branch,
         }, 502);
       }
-    }
+  }
 
     const prResponse = await github(
       env.GITHUB_TOKEN,
