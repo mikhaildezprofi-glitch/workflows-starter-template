@@ -7,6 +7,7 @@ const TARGET_OWNER = "mikhaildezprofi-glitch";
 const TARGET_REPO = "free-cloud-youtube-studio";
 const MAX_BODY_BYTES = 200_000;
 const MAX_FILES = 10;
+const MAX_FILE_BYTES = 100_000;
 
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
@@ -32,15 +33,15 @@ function validPath(path: unknown): path is string {
   if (
     path.startsWith("/") ||
     path.includes("\\") ||
+    path.includes("%") ||
     path.split("/").some((part) => part === ".." || part === "." || part === "")
   ) {
     return false;
   }
 
-  // Запрещаем изменения CI/CD, секретов и конфигурации шлюза.
   const blocked = [
-    /^\.github\/workflows\//i,
-    /(^|\/)\.env($|\.)/i,
+    /^\.github\/workflows(?:\/|$)/i,
+    /(^|\/)\.env(?:$|\.)/i,
     /(^|\/)(secrets?|credentials?)(\/|$)/i,
     /^worker\/github-gateway\.ts$/i,
   ];
@@ -75,10 +76,14 @@ export async function handleGitHubGateway(
     return json({ error: "Method not allowed" }, 405);
   }
 
+  if (!env.GATEWAY_API_KEY) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
   const expected = `Bearer ${env.GATEWAY_API_KEY}`;
   const actual = request.headers.get("Authorization") ?? "";
 
-  if (!env.GATEWAY_API_KEY || !safeEqual(actual, expected)) {
+  if (!safeEqual(actual, expected)) {
     return json({ error: "Unauthorized" }, 401);
   }
 
@@ -86,17 +91,23 @@ export async function handleGitHubGateway(
     return json({ error: "Gateway configuration error" }, 500);
   }
 
-  const declaredLength = Number(request.headers.get("Content-Length") ?? "0");
+  const declaredLength = Number(
+    request.headers.get("Content-Length") ?? "0",
+  );
+
   if (declaredLength > MAX_BODY_BYTES) {
     return json({ error: "Request too large" }, 413);
   }
 
   let body: unknown;
+
   try {
     const raw = await request.text();
+
     if (new TextEncoder().encode(raw).byteLength > MAX_BODY_BYTES) {
       return json({ error: "Request too large" }, 413);
     }
+
     body = JSON.parse(raw);
   } catch {
     return json({ error: "Invalid JSON" }, 400);
@@ -112,12 +123,69 @@ export async function handleGitHubGateway(
   }
 
   const files = body.files as unknown[];
+
   if (files.length < 1 || files.length > MAX_FILES) {
     return json({ error: `Provide 1 to ${MAX_FILES} files` }, 400);
   }
 
   const seen = new Set<string>();
-  for (const item of files as { path: string; content: string }[]) {
+
+  for (const item of files) {
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      !("path" in item) ||
+      !("content" in item)
+    ) {
+      return json({ error: "Each file needs path and content" }, 400);
+    }
+
+    const file = item as { path: unknown; content: unknown };
+
+    if (
+      !validPath(file.path) ||
+      typeof file.content !== "string" ||
+      new TextEncoder().encode(file.content).byteLength > MAX_FILE_BYTES ||
+      seen.has(file.path)
+    ) {
+      return json({ error: "Invalid, duplicate, or oversized file" }, 400);
+    }
+
+    seen.add(file.path);
+  }
+
+  const apiBase = `/repos/${TARGET_OWNER}/${TARGET_REPO}`;
+  const branch = `gateway/proposal-${crypto.randomUUID()}`;
+
+  try {
+    const baseResponse = await github(
+      env.GITHUB_TOKEN,
+      `${apiBase}/git/ref/heads/main`,
+    );
+
+    if (!baseResponse.ok) {
+      return json({ error: "Could not read base branch" }, 502);
+    }
+
+    const baseData = (await baseResponse.json()) as {
+      object: { sha: string };
+    };
+
+    const branchResponse = await github(
+      env.GITHUB_TOKEN,
+      `${apiBase}/git/refs`,
+      "POST",
+      {
+        ref: `refs/heads/${branch}`,
+        sha: baseData.object.sha,
+      },
+    );
+
+    if (!branchResponse.ok) {
+      return json({ error: "Could not create proposal branch" }, 502);
+    }
+
+    for (const item of files as { path: string; content: string }[]) {
       const encodedPath = item.path
         .split("/")
         .map(encodeURIComponent)
@@ -132,8 +200,17 @@ export async function handleGitHubGateway(
 
       if (existingResponse.ok) {
         const existingData = (await existingResponse.json()) as {
-          sha: string;
+          sha?: string;
+          type?: string;
         };
+
+        if (existingData.type !== "file" || !existingData.sha) {
+          return json({
+            error: "Target path is not a regular file",
+            branch,
+          }, 400);
+        }
+
         existingSha = existingData.sha;
       } else if (existingResponse.status !== 404) {
         return json({
@@ -175,7 +252,7 @@ export async function handleGitHubGateway(
           branch,
         }, 502);
       }
-  }
+    }
 
     const prResponse = await github(
       env.GITHUB_TOKEN,
