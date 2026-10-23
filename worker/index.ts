@@ -1,3 +1,4 @@
+import { handleGitHubGateway } from "./github-gateway";
 // Export the Workflow and Durable Object classes
 export { MyWorkflow } from "./workflow";
 export { WorkflowStatusDO } from "./durable-object";
@@ -14,6 +15,9 @@ export { WorkflowStatusDO } from "./durable-object";
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === "/api/github/propose") {
+    return handleGitHubGateway(request, env);
+		}
 
 		// API: Start a new workflow instance
 		if (url.pathname === "/api/workflow/start" && request.method === "POST") {
